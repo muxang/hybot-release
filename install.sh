@@ -51,21 +51,27 @@ if [ "$ROLLBACK" = "1" ]; then
 fi
 
 # ---------- 下载最新 Release ----------
+# 用资产 API url + Accept: octet-stream（对公开/私有仓库都工作，与程序内自升级 upgrade.rs 一致；
+# 私有仓库的 browser_download_url 即使带 token 也 404）。
 say "获取最新 Release 信息…"
 API="https://api.github.com/repos/$REPO/releases/latest"
 AUTH=()
 [ -n "${GITHUB_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN")
-JSON=$(curl -fsSL "${AUTH[@]}" "$API") || die "获取 Release 失败(网络/仓库不存在?)"
+JSON=$(curl -fsSL "${AUTH[@]}" -H "Accept: application/vnd.github+json" "$API") || die "获取 Release 失败(网络/仓库不存在?)"
 TAG=$(echo "$JSON" | grep -m1 '"tag_name"' | cut -d'"' -f4)
-BIN_URL=$(echo "$JSON" | grep '"browser_download_url"' | grep "$ASSET\"" | cut -d'"' -f4)
-SHA_URL=$(echo "$JSON" | grep '"browser_download_url"' | grep "$ASSET.sha256" | cut -d'"' -f4)
+# 每个 asset 的 API url 形如 .../releases/assets/<id>；按 name 定位其 id
+asset_api_url() {
+  echo "$JSON" | tr ',' '\n' | grep -B3 "\"name\": *\"$1\"" | grep '"url"' | grep '/releases/assets/' | head -1 | cut -d'"' -f4
+}
+BIN_URL=$(asset_api_url "$ASSET")
+SHA_URL=$(asset_api_url "$ASSET.sha256")
 [ -n "$TAG" ] && [ -n "$BIN_URL" ] && [ -n "$SHA_URL" ] || die "Release 缺少 $ASSET 附件"
 say "最新版本: $TAG"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-curl -fsSL "${AUTH[@]}" -o "$TMP/$ASSET" "$BIN_URL" || die "下载二进制失败"
-curl -fsSL "${AUTH[@]}" -o "$TMP/$ASSET.sha256" "$SHA_URL" || die "下载校验文件失败"
+curl -fsSL "${AUTH[@]}" -H "Accept: application/octet-stream" -o "$TMP/$ASSET" "$BIN_URL" || die "下载二进制失败"
+curl -fsSL "${AUTH[@]}" -H "Accept: application/octet-stream" -o "$TMP/$ASSET.sha256" "$SHA_URL" || die "下载校验文件失败"
 say "校验 sha256…"
 (cd "$TMP" && sha256sum -c "$ASSET.sha256" >/dev/null) || die "sha256 校验失败, 中止"
 
@@ -80,20 +86,24 @@ say "二进制已安装: $APP_DIR/hybot ($TAG)"
 
 # ---------- .env(仅首次生成, 不覆盖已有配置) ----------
 if [ ! -f "$APP_DIR/.env" ]; then
-  cat > "$APP_DIR/.env" <<EOF
+  # 生成随机管理密码（避免内置可被公开获知的默认密码；用户可在面板改）
+  GENPASS=$( (command -v openssl >/dev/null && openssl rand -hex 16) || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  ( umask 077   # .env 从创建起就 600，杜绝 world-readable 窗口
+    cat > "$APP_DIR/.env" <<EOF
 # hybot 环境变量(全部参数也可在面板"设置"页配置, 面板配置优先级更高)
 USE_TESTNET=false
 START_PAUSED=true
 DASH_HOST=0.0.0.0
 DASH_PORT=8788
-DASH_PASS=请改成你的管理密码
+DASH_PASS=$GENPASS
 # BINANCE_API_KEY=
 # BINANCE_API_SECRET=
 # CMC_API_KEY=
 UPGRADE_REPO=$REPO
 EOF
-  chmod 600 "$APP_DIR/.env"
-  say "已生成 $APP_DIR/.env (请填写密码/密钥, 或稍后在面板设置页配置)"
+  )
+  say "已生成随机管理密码: \033[1;33m$GENPASS\033[0m  （已写入 .env，请妥善保存或在面板改）"
+  say "已生成 $APP_DIR/.env (API key 可稍后在面板设置页配置)"
 fi
 
 # ---------- systemd 服务 ----------
@@ -119,8 +129,12 @@ LogRateLimitBurst=2000
 WantedBy=multi-user.target
 EOF
 
-# ---------- journald 大小上限(全局 200M, 影响所有服务的持久日志) ----------
-if [ ! -f /etc/systemd/journald.conf.d/99-hybot.conf ]; then
+# ---------- 日志大小控制 ----------
+# 三层：① 程序自身 logs/bot.log 轮转 5MB×3（默认，已隔离到本服务）
+#      ② service 单元 LogRateLimit 限速（上面 unit 里，仅本服务）
+#      ③ journald 全局上限（可选，默认不动——它影响 VPS 上所有服务的日志保留量）
+# 想启用全局 journald 上限：LIMIT_JOURNAL=1 bash install.sh
+if [ "${LIMIT_JOURNAL:-0}" = "1" ] && [ ! -f /etc/systemd/journald.conf.d/99-hybot.conf ]; then
   sudo mkdir -p /etc/systemd/journald.conf.d
   sudo tee /etc/systemd/journald.conf.d/99-hybot.conf >/dev/null <<EOF
 [Journal]
@@ -128,7 +142,9 @@ SystemMaxUse=200M
 RuntimeMaxUse=100M
 EOF
   sudo systemctl restart systemd-journald || true
-  say "journald 日志上限已设为 200M"
+  say "journald 全局日志上限已设为 200M（影响所有服务）"
+else
+  say "journald 全局上限未改（程序自身 logs/bot.log 已轮转；如需全局限制用 LIMIT_JOURNAL=1）"
 fi
 
 sudo systemctl daemon-reload
