@@ -65,27 +65,49 @@ if [ "$ROLLBACK" = "1" ]; then
 fi
 
 # ---------- 下载最新 Release ----------
-# 用资产 API url + Accept: octet-stream（对公开/私有仓库都工作，与程序内自升级 upgrade.rs 一致；
-# 私有仓库的 browser_download_url 即使带 token 也 404）。
 say "获取最新 Release 信息…"
 API="https://api.github.com/repos/$REPO/releases/latest"
-AUTH=()
-[ -n "${GITHUB_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GITHUB_TOKEN")
-JSON=$(curl -fsSL "${AUTH[@]}" -H "Accept: application/vnd.github+json" "$API") || die "获取 Release 失败(网络/仓库不存在?)"
-TAG=$(echo "$JSON" | grep -m1 '"tag_name"' | cut -d'"' -f4)
-# 每个 asset 的 API url 形如 .../releases/assets/<id>；按 name 定位其 id
-asset_api_url() {
-  echo "$JSON" | tr ',' '\n' | grep -B3 "\"name\": *\"$1\"" | grep '"url"' | grep '/releases/assets/' | head -1 | cut -d'"' -f4
-}
-BIN_URL=$(asset_api_url "$ASSET")
-SHA_URL=$(asset_api_url "$ASSET.sha256")
-[ -n "$TAG" ] && [ -n "$BIN_URL" ] && [ -n "$SHA_URL" ] || die "Release 缺少 $ASSET 附件"
-say "最新版本: $TAG"
+# 所有 curl 都带超时/重试，避免网络卡住时无限挂起
+CURL=(curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 --retry-delay 2)
+HJSON=(-H "Accept: application/vnd.github+json")
+[ -n "${GITHUB_TOKEN:-}" ] && HJSON+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+JSON=$("${CURL[@]}" "${HJSON[@]}" "$API") || die "获取 Release 失败(网络不通/仓库不存在/限频?)"
 
+# 解析：优先 python3（健壮，公开/私有仓库都对）；否则回退 grep browser_download_url（公开仓库可用）。
+# 公开仓库用 browser_download_url 直下；有 GITHUB_TOKEN(私有仓库)则用资产 API url + octet-stream。
+export _ASSET="$ASSET"
+if command -v python3 >/dev/null 2>&1; then
+  PARSED=$(printf '%s' "$JSON" | python3 -c '
+import json,sys,os
+d=json.load(sys.stdin); asset=os.environ["_ASSET"]; tok=bool(os.environ.get("GITHUB_TOKEN"))
+def find(n):
+    for a in d.get("assets",[]):
+        if a.get("name")==n: return a
+    return None
+def url(a): return (a.get("url") if tok else a.get("browser_download_url")) if a else ""
+b=find(asset); s=find(asset+".sha256")
+print("%s\t%s\t%s\t%s" % (d.get("tag_name",""), url(b), url(s), "api" if tok else "browser"))
+' 2>/dev/null) || PARSED=""
+  IFS=$'\t' read -r TAG BIN_URL SHA_URL DL_MODE <<<"$PARSED"
+else
+  TAG=$(printf '%s' "$JSON" | grep -m1 '"tag_name"' | cut -d'"' -f4 || true)
+  BIN_URL=$(printf '%s' "$JSON" | grep '"browser_download_url"' | grep "/$ASSET\"" | head -1 | cut -d'"' -f4 || true)
+  SHA_URL=$(printf '%s' "$JSON" | grep '"browser_download_url"' | grep "/$ASSET\.sha256\"" | head -1 | cut -d'"' -f4 || true)
+  DL_MODE=browser
+fi
+[ -n "${TAG:-}" ] && [ -n "${BIN_URL:-}" ] && [ -n "${SHA_URL:-}" ] || \
+  die "解析 Release 附件失败(TAG='${TAG:-}')。请确认 $REPO 有 $ASSET 附件。JSON 前 200 字符：$(printf '%s' "$JSON" | head -c 200)"
+say "最新版本: $TAG（下载方式: $DL_MODE）"
+
+# 下载：browser 模式直下（公开仓库无需鉴权）；api 模式带 octet-stream(+token)
+DLH=()
+[ "$DL_MODE" = "api" ] && DLH+=(-H "Accept: application/octet-stream")
+[ "$DL_MODE" = "api" ] && [ -n "${GITHUB_TOKEN:-}" ] && DLH+=(-H "Authorization: Bearer $GITHUB_TOKEN")
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-curl -fsSL "${AUTH[@]}" -H "Accept: application/octet-stream" -o "$TMP/$ASSET" "$BIN_URL" || die "下载二进制失败"
-curl -fsSL "${AUTH[@]}" -H "Accept: application/octet-stream" -o "$TMP/$ASSET.sha256" "$SHA_URL" || die "下载校验文件失败"
+say "下载二进制…"
+"${CURL[@]}" "${DLH[@]}" -o "$TMP/$ASSET" "$BIN_URL" || die "下载二进制失败"
+"${CURL[@]}" "${DLH[@]}" -o "$TMP/$ASSET.sha256" "$SHA_URL" || die "下载校验文件失败"
 say "校验 sha256…"
 (cd "$TMP" && sha256sum -c "$ASSET.sha256" >/dev/null) || die "sha256 校验失败, 中止"
 
