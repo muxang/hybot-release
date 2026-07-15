@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # hybot 在线安装/更新脚本
-# 用法:
+# 用法（脚本内部会用 sudo 装 systemd 服务；用 root 运行则不需要 sudo）：
+#   # 推荐：先下载再运行，这样 sudo 能在终端弹密码
+#   curl -fsSL https://raw.githubusercontent.com/muxang/hybot-release/main/install.sh -o hybot-install.sh && bash hybot-install.sh
+#   # 若是 root（或已配置免密 sudo），可直接管道执行：
 #   curl -fsSL https://raw.githubusercontent.com/muxang/hybot-release/main/install.sh | bash
+#
 #   bash install.sh              # 安装/更新到最新 Release
 #   bash install.sh --rollback   # 回滚到上一个二进制(hybot.old)
 #   bash install.sh --no-start   # 只安装不启动(首次部署想先改 .env 时用)
@@ -9,10 +13,7 @@
 # 说明:
 # - 二进制为 musl 静态链接, 免依赖
 # - 幂等: 重复执行 = 更新二进制(先停服务, 替换, 再启动)
-# - 日志三层控制:
-#     1) 程序自身: logs/bot.log 轮转 5MB×3
-#     2) journald: 全局上限 SystemMaxUse=200M (drop-in)
-#     3) service 单元: 日志限速防刷屏
+# - 日志: ①程序自身 logs/bot.log 轮转 5MB×3 ②service 单元限速 ③journald 全局上限(可选 LIMIT_JOURNAL=1)
 set -euo pipefail
 
 REPO="muxang/hybot-release"
@@ -31,6 +32,19 @@ done
 say() { echo -e "\033[1;32m[hybot-install]\033[0m $*"; }
 die() { echo -e "\033[1;31m[hybot-install] 错误:\033[0m $*" >&2; exit 1; }
 
+# root 直接执行、非 root 用 sudo；都没有则报错指引
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+elif command -v sudo >/dev/null; then
+  SUDO="sudo"
+  # 管道执行(curl|bash)时 stdin 是脚本，sudo 无法弹密码 → 先探测免密
+  if ! sudo -n true 2>/dev/null && [ ! -t 0 ]; then
+    die "需要 sudo 但当前是管道执行且非免密 sudo。请改用：curl -fsSL <url> -o hybot-install.sh && bash hybot-install.sh（或用 root 运行）"
+  fi
+else
+  die "非 root 且无 sudo，无法安装 systemd 服务。请用 root 运行。"
+fi
+
 command -v curl >/dev/null || die "需要 curl"
 command -v sha256sum >/dev/null || die "需要 sha256sum"
 command -v systemctl >/dev/null || die "需要 systemd"
@@ -41,11 +55,11 @@ mkdir -p "$APP_DIR" "$APP_DIR/data" "$APP_DIR/logs"
 # ---------- 回滚模式 ----------
 if [ "$ROLLBACK" = "1" ]; then
   [ -f "$APP_DIR/hybot.old" ] || die "没有 $APP_DIR/hybot.old 可回滚"
-  sudo systemctl stop "$SERVICE" || true
+  $SUDO systemctl stop "$SERVICE" || true
   mv "$APP_DIR/hybot" "$APP_DIR/hybot.bad" 2>/dev/null || true
   mv "$APP_DIR/hybot.old" "$APP_DIR/hybot"
   chmod +x "$APP_DIR/hybot"
-  sudo systemctl start "$SERVICE"
+  $SUDO systemctl start "$SERVICE"
   say "已回滚到上一版本(问题版本保留为 hybot.bad)"
   exit 0
 fi
@@ -78,7 +92,7 @@ say "校验 sha256…"
 # ---------- 安装二进制(保留旧版为 .old 供回滚) ----------
 if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
   say "停止运行中的服务…"
-  sudo systemctl stop "$SERVICE"
+  $SUDO systemctl stop "$SERVICE"
 fi
 [ -f "$APP_DIR/hybot" ] && cp -f "$APP_DIR/hybot" "$APP_DIR/hybot.old"
 install -m 755 "$TMP/$ASSET" "$APP_DIR/hybot"
@@ -107,7 +121,7 @@ EOF
 fi
 
 # ---------- systemd 服务 ----------
-sudo tee /etc/systemd/system/$SERVICE.service >/dev/null <<EOF
+$SUDO tee /etc/systemd/system/$SERVICE.service >/dev/null <<EOF
 [Unit]
 Description=hybot binance futures bot
 After=network-online.target
@@ -135,25 +149,25 @@ EOF
 #      ③ journald 全局上限（可选，默认不动——它影响 VPS 上所有服务的日志保留量）
 # 想启用全局 journald 上限：LIMIT_JOURNAL=1 bash install.sh
 if [ "${LIMIT_JOURNAL:-0}" = "1" ] && [ ! -f /etc/systemd/journald.conf.d/99-hybot.conf ]; then
-  sudo mkdir -p /etc/systemd/journald.conf.d
-  sudo tee /etc/systemd/journald.conf.d/99-hybot.conf >/dev/null <<EOF
+  $SUDO mkdir -p /etc/systemd/journald.conf.d
+  $SUDO tee /etc/systemd/journald.conf.d/99-hybot.conf >/dev/null <<EOF
 [Journal]
 SystemMaxUse=200M
 RuntimeMaxUse=100M
 EOF
-  sudo systemctl restart systemd-journald || true
+  $SUDO systemctl restart systemd-journald || true
   say "journald 全局日志上限已设为 200M（影响所有服务）"
 else
   say "journald 全局上限未改（程序自身 logs/bot.log 已轮转；如需全局限制用 LIMIT_JOURNAL=1）"
 fi
 
-sudo systemctl daemon-reload
-sudo systemctl enable "$SERVICE" >/dev/null
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable "$SERVICE" >/dev/null
 
 if [ "$NO_START" = "1" ]; then
   say "安装完成(未启动)。启动: sudo systemctl start $SERVICE"
 else
-  sudo systemctl start "$SERVICE"
+  $SUDO systemctl start "$SERVICE"
   sleep 2
   systemctl is-active --quiet "$SERVICE" && say "服务已启动 ✓" || die "服务启动失败, 查看: journalctl -u $SERVICE -n 50"
   PORT=$(grep -oP '^DASH_PORT=\K\d+' "$APP_DIR/.env" 2>/dev/null || echo 8788)
