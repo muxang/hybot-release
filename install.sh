@@ -32,6 +32,19 @@ done
 say() { echo -e "\033[1;32m[hybot-install]\033[0m $*"; }
 die() { echo -e "\033[1;31m[hybot-install] 错误:\033[0m $*" >&2; exit 1; }
 
+# 获取公网 IP：云 metadata（最可靠）→ 外部回显服务 → 回退内网 IP
+pub_ip() {
+  local ip=""
+  for u in \
+    "http://metadata.tencentyun.com/latest/meta-data/public-ipv4" \
+    "http://169.254.169.254/latest/meta-data/public-ipv4" \
+    "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
+    ip=$(curl -s --max-time 4 "$u" 2>/dev/null | tr -d '[:space:]')
+    echo "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && { echo "$ip"; return; }
+  done
+  hostname -I 2>/dev/null | awk '{print $1}'
+}
+
 # root 直接执行、非 root 用 sudo；都没有则报错指引
 if [ "$(id -u)" -eq 0 ]; then
   SUDO=""
@@ -121,9 +134,8 @@ install -m 755 "$TMP/$ASSET" "$APP_DIR/hybot"
 say "二进制已安装: $APP_DIR/hybot ($TAG)"
 
 # ---------- .env(仅首次生成, 不覆盖已有配置) ----------
+gen_pass() { (command -v openssl >/dev/null && openssl rand -hex 16) || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
 if [ ! -f "$APP_DIR/.env" ]; then
-  # 生成随机管理密码（避免内置可被公开获知的默认密码；用户可在面板改）
-  GENPASS=$( (command -v openssl >/dev/null && openssl rand -hex 16) || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
   ( umask 077   # .env 从创建起就 600，杜绝 world-readable 窗口
     cat > "$APP_DIR/.env" <<EOF
 # hybot 环境变量(全部参数也可在面板"设置"页配置, 面板配置优先级更高)
@@ -131,15 +143,26 @@ USE_TESTNET=false
 START_PAUSED=true
 DASH_HOST=0.0.0.0
 DASH_PORT=8788
-DASH_PASS=$GENPASS
+DASH_PASS=
 # BINANCE_API_KEY=
 # BINANCE_API_SECRET=
 # CMC_API_KEY=
 UPGRADE_REPO=$REPO
 EOF
   )
-  say "已生成随机管理密码: \033[1;33m$GENPASS\033[0m  （已写入 .env，请妥善保存或在面板改）"
   say "已生成 $APP_DIR/.env (API key 可稍后在面板设置页配置)"
+fi
+
+# 确保有管理密码：旧 .env 可能没设/是占位符/为空 —— 都补一个随机密码（不覆盖已有的真密码）
+CURPASS=$(grep -m1 '^DASH_PASS=' "$APP_DIR/.env" 2>/dev/null | cut -d= -f2- | tr -d '\r')
+if [ -z "$CURPASS" ] || [ "$CURPASS" = "请改成你的管理密码" ]; then
+  CURPASS=$(gen_pass)
+  if grep -q '^DASH_PASS=' "$APP_DIR/.env"; then
+    sed -i "s#^DASH_PASS=.*#DASH_PASS=$CURPASS#" "$APP_DIR/.env"
+  else
+    echo "DASH_PASS=$CURPASS" >> "$APP_DIR/.env"
+  fi
+  chmod 600 "$APP_DIR/.env"
 fi
 
 # ---------- systemd 服务 ----------
@@ -186,12 +209,23 @@ fi
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable "$SERVICE" >/dev/null
 
+PORT=$(grep -oP '^DASH_PORT=\K\d+' "$APP_DIR/.env" 2>/dev/null || echo 8788)
 if [ "$NO_START" = "1" ]; then
   say "安装完成(未启动)。启动: sudo systemctl start $SERVICE"
 else
   $SUDO systemctl start "$SERVICE"
   sleep 2
-  systemctl is-active --quiet "$SERVICE" && say "服务已启动 ✓" || die "服务启动失败, 查看: journalctl -u $SERVICE -n 50"
-  PORT=$(grep -oP '^DASH_PORT=\K\d+' "$APP_DIR/.env" 2>/dev/null || echo 8788)
-  say "面板: http://$(hostname -I | awk '{print $1}'):$PORT  (日志: journalctl -u $SERVICE -f)"
+  systemctl is-active --quiet "$SERVICE" || die "服务启动失败, 查看: journalctl -u $SERVICE -n 50"
+  say "服务已启动 ✓"
 fi
+
+# ---------- 安装完成信息（始终显示：公网 IP + 面板地址 + 管理密码）----------
+IP=$(pub_ip)
+echo
+echo -e "\033[1;36m========== hybot 安装完成 ($TAG) ==========\033[0m"
+echo -e "  面板地址:  \033[1;32mhttp://$IP:$PORT\033[0m"
+echo -e "  管理密码:  \033[1;33m$CURPASS\033[0m   （写操作/登录用，可在面板设置页改）"
+echo -e "  日志查看:  journalctl -u $SERVICE -f   或   tail -f $APP_DIR/logs/bot.log"
+echo -e "  \033[1;31m提示\033[0m: 若面板打不开，请到云服务器安全组放行 TCP 端口 \033[1;33m$PORT\033[0m（公网入站）"
+echo -e "        进面板后到「设置」配置 币安 Key/Secret + CoinMarketCap Key，保存后自动连接"
+echo -e "\033[1;36m===========================================\033[0m"
